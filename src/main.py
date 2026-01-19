@@ -9,6 +9,7 @@ import re
 import sys
 import threading
 import time
+import atexit
 
 from typing import (
     Callable,
@@ -67,6 +68,9 @@ class Options:
     show_errors: bool = False
     show_timings: bool = False
     print_diffs: bool = False
+    print_source: bool = False
+    print_all: bool = False
+    print_tui: bool = False
     stack_differences: bool = False
     algorithm: str = "difflib"
     abort_exceptions: bool = False
@@ -113,6 +117,94 @@ class EvalContext:
     internal_error_stack_traces: Set[str] = field(default_factory=set)
     overall_profiler: Profiler = field(default_factory=Profiler)
     permuters: List[Permuter] = field(default_factory=list)
+    tui: Optional["TuiRenderer"] = None
+
+
+class TuiRenderer:
+    _best_score: Optional[int] = None
+    _best_source: Optional[str] = None
+    _best_name: Optional[str] = None
+    _current_score: Optional[int] = None
+    _current_source: Optional[str] = None
+    _current_name: Optional[str] = None
+
+    def __init__(self, no_context_output: bool) -> None:
+        self._no_context_output = no_context_output
+        self._started = False
+        self._last_line_count = 0
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        atexit.register(self.stop)
+        print("\u001b[?1049h\u001b[?25l\u001b[2J\u001b[H", end="", flush=True)
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._started = False
+        print("\u001b[?25h\u001b[?1049l", end="", flush=True)
+
+    def update(self, permuter: Permuter, result: CandidateResult) -> None:
+        if result.source is None:
+            return
+        if result.score == permuter.scorer.PENALTY_INF:
+            return
+        source = result.source
+        if self._no_context_output:
+            source = trim_source(source, permuter.fn_name)
+
+        self._current_score = result.score
+        self._current_source = source
+        self._current_name = permuter.unique_name
+
+        if self._best_score is None or result.score < self._best_score:
+            self._best_score = result.score
+            self._best_source = source
+            self._best_name = permuter.unique_name
+
+        self.render()
+
+    def render(self) -> None:
+        if self._current_source is None:
+            return
+        header_color = "\u001b[36;1m"
+        best_color = "\u001b[32;1m"
+        current_color = "\u001b[33m"
+        reset = "\u001b[0m"
+
+        best_label = "Best so far"
+        if self._best_name:
+            best_label += f" [{self._best_name}]"
+        if self._best_score is not None:
+            best_label += f" (score {self._best_score})"
+
+        current_label = "Current candidate"
+        if self._current_name:
+            current_label += f" [{self._current_name}]"
+        if self._current_score is not None:
+            current_label += f" (score {self._current_score})"
+
+        lines: List[str] = []
+        lines.append(f"{header_color}Permutation Viewer{reset}")
+        lines.append(f"{best_color}{best_label}{reset}")
+        if self._best_source is not None:
+            lines.extend(self._best_source.rstrip().splitlines())
+        lines.append("")
+        lines.append(f"{current_color}{current_label}{reset}")
+        lines.extend(self._current_source.rstrip().splitlines())
+
+        print("\u001b[H", end="")
+        for line in lines:
+            print("\u001b[2K\r" + line)
+
+        extra_lines = self._last_line_count - len(lines)
+        for _ in range(max(extra_lines, 0)):
+            print("\u001b[2K")
+
+        self._last_line_count = len(lines)
+        print("", end="", flush=True)
 
 
 def write_candidate(
@@ -208,9 +300,39 @@ def post_score(
         else:
             color = "\u001b[33m"
             msg = f"found different asm with same score ({score_value})"
-        context.printer.print(msg, permuter, who, color=color)
+        if not context.options.print_tui:
+            context.printer.print(msg, permuter, who, color=color)
         write_candidate(permuter, result, context.options.no_context_output)
-    if not context.options.quiet:
+        if context.options.print_source and not context.options.print_tui:
+            assert result.source is not None, "Permuter._need_to_send_source is wrong"
+            source = result.source
+            if context.options.no_context_output:
+                source = trim_source(source, permuter.fn_name)
+            print()
+            print(f"----- candidate source (score {score_value}) -----")
+            print(source.rstrip())
+            print("----- end candidate source -----")
+    if (
+        context.options.print_all
+        and not context.options.print_tui
+        and isinstance(result, CandidateResult)
+        and result.source is not None
+    ):
+        source = result.source
+        if context.options.no_context_output:
+            source = trim_source(source, permuter.fn_name)
+        context.printer.print(
+            f"candidate (score {score_value})", permuter, who, color="\u001b[36m"
+        )
+        print(source.rstrip())
+
+    if (
+        context.options.print_tui
+        and context.tui is not None
+        and isinstance(result, CandidateResult)
+    ):
+        context.tui.update(permuter, result)
+    if not context.options.quiet and not context.options.print_tui:
         context.printer.progress(status_line)
     return score_value == 0
 
@@ -386,7 +508,9 @@ def run_inner(options: Options, heartbeat: Callable[[], None]) -> List[int]:
                 force_rng_seed=force_rng_seed,
                 keep_prob=options.keep_prob,
                 need_profiler=options.show_timings,
-                need_all_sources=options.print_diffs,
+                need_all_sources=(
+                    options.print_diffs or options.print_all or options.print_tui
+                ),
                 show_errors=options.show_errors,
                 best_only=options.best_only,
                 better_only=options.better_only,
@@ -406,6 +530,10 @@ def run_inner(options: Options, heartbeat: Callable[[], None]) -> List[int]:
         print("No permuters!")
         return []
 
+    if options.print_tui:
+        context.tui = TuiRenderer(options.no_context_output)
+        context.tui.start()
+
     for permuter in context.permuters:
         if name_counts[permuter.fn_name] > 1:
             permuter.unique_name += f" ({permuter.dir})"
@@ -416,181 +544,187 @@ def run_inner(options: Options, heartbeat: Callable[[], None]) -> List[int]:
         sys.exit(0)
 
     found_zero = False
-    if options.threads == 1 and not options.use_network:
-        # Simple single-threaded mode. This is not technically needed, but
-        # makes the permuter easier to debug.
-        for permuter_index, seed in cycle_seeds(context.permuters):
-            heartbeat()
-            permuter = context.permuters[permuter_index]
+    try:
+        if options.threads == 1 and not options.use_network:
+            # Simple single-threaded mode. This is not technically needed, but
+            # makes the permuter easier to debug.
+            for permuter_index, seed in cycle_seeds(context.permuters):
+                heartbeat()
+                permuter = context.permuters[permuter_index]
 
-            start = time.time()
+                start = time.time()
 
-            result = permuter.try_eval_candidate(seed)
-            if post_score(context, permuter, result, None):
-                found_zero = True
-                if options.stop_on_zero:
-                    break
-
-            if permuter.speed != 100:
-                end = time.time()
-
-                sleep_time = (end - start) * ((100 / permuter.speed) - 1)
-                time.sleep(sleep_time)
-    else:
-        seed_iterators: List[Optional[Iterator[int]]] = [
-            permuter.seed_iterator() for permuter in context.permuters
-        ]
-        seed_iterators_remaining = len(seed_iterators)
-        next_iterator_index = 0
-
-        # Create queues.
-        worker_task_queue: "Queue[Task]" = Queue()
-        feedback_queue: "Queue[Feedback]" = Queue()
-
-        # Connect to network and create client threads and queues.
-        net_conns: "List[Tuple[threading.Thread, Queue[Task]]]" = []
-        if options.use_network:
-            # Importing the networking modules here so dependencies don't need to be loaded when not using the network mode
-            from .net.client import start_client
-            from .net.core import ServerError, connect, enable_debug_mode
-
-            print("Connecting to permuter@home...")
-            if options.network_debug:
-                enable_debug_mode()
-            first_stats: Optional[Tuple[int, int, float]] = None
-            for perm_index in range(len(context.permuters)):
-                try:
-                    port = connect()
-                except (EOFError, ServerError) as e:
-                    print("Error:", e)
-                    sys.exit(1)
-                thread, queue, stats = start_client(
-                    port,
-                    context.permuters[perm_index],
-                    perm_index,
-                    feedback_queue,
-                    options.network_priority,
-                )
-                net_conns.append((thread, queue))
-                if first_stats is None:
-                    first_stats = stats
-            assert first_stats is not None, "has at least one permuter"
-            clients_str = plural(first_stats[0], "other client")
-            servers_str = plural(first_stats[1], "server")
-            cores_str = plural(int(first_stats[2]), "core")
-            print(f"Connected! {servers_str} online ({cores_str}, {clients_str})")
-
-        # Start local worker threads
-        processes: List[multiprocessing.Process] = []
-        for _i in range(options.threads):
-            p = multiprocessing.Process(
-                target=multiprocess_worker,
-                args=(context.permuters, worker_task_queue, feedback_queue),
-            )
-            p.start()
-            processes.append(p)
-
-        active_workers = len(processes)
-
-        if not active_workers and not net_conns:
-            print("No workers available! Exiting.")
-            sys.exit(1)
-
-        def process_finish(finish: Finished, source: int) -> None:
-            nonlocal active_workers
-
-            if finish.reason:
-                permuter: Optional[Permuter] = None
-                if source != -1 and len(context.permuters) > 1:
-                    permuter = context.permuters[source]
-                context.printer.print(finish.reason, permuter, None, keep_progress=True)
-
-            if source == -1:
-                active_workers -= 1
-
-        def process_result(work: WorkDone, who: Optional[str]) -> bool:
-            permuter = context.permuters[work.perm_index]
-            return post_score(context, permuter, work.result, who)
-
-        def get_task(perm_index: int) -> Optional[Tuple[int, int]]:
-            nonlocal next_iterator_index, seed_iterators_remaining
-            if perm_index == -1:
-                while seed_iterators_remaining > 0:
-                    task = get_task(next_iterator_index)
-                    next_iterator_index += 1
-                    next_iterator_index %= len(seed_iterators)
-                    if task is not None:
-                        return task
-            else:
-                it = seed_iterators[perm_index]
-                if it is not None:
-                    seed = next(it, None)
-                    if seed is None:
-                        seed_iterators[perm_index] = None
-                        seed_iterators_remaining -= 1
-                    else:
-                        return (perm_index, seed)
-            return None
-
-        # Feed the task queue with work and read from results queue.
-        # We generally match these up one-by-one to avoid overfilling queues,
-        # but workers can ask us to add more tasks into the system if they run
-        # out of work. (This will happen e.g. at the very beginning, when the
-        # queues are empty.)
-        while seed_iterators_remaining > 0:
-            heartbeat()
-            feedback, source, who = feedback_queue.get()
-            if isinstance(feedback, Finished):
-                process_finish(feedback, source)
-            elif isinstance(feedback, Message):
-                context.printer.print(feedback.text, None, who, keep_progress=True)
-            elif isinstance(feedback, WorkDone):
-                if process_result(feedback, who):
-                    # Found score 0!
+                result = permuter.try_eval_candidate(seed)
+                if post_score(context, permuter, result, None):
                     found_zero = True
                     if options.stop_on_zero:
                         break
-            elif isinstance(feedback, NeedMoreWork):
-                task = get_task(source)
-                if task is not None:
-                    if source == -1:
-                        worker_task_queue.put(task)
-                    else:
-                        net_conns[source][1].put(task)
-            else:
-                static_assert_unreachable(feedback)
 
-        # Signal workers to stop.
-        for _i in range(active_workers):
-            worker_task_queue.put(Finished())
+                if permuter.speed != 100:
+                    end = time.time()
 
-        for conn in net_conns:
-            conn[1].put(Finished())
+                    sleep_time = (end - start) * ((100 / permuter.speed) - 1)
+                    time.sleep(sleep_time)
+        else:
+            seed_iterators: List[Optional[Iterator[int]]] = [
+                permuter.seed_iterator() for permuter in context.permuters
+            ]
+            seed_iterators_remaining = len(seed_iterators)
+            next_iterator_index = 0
 
-        # Await final results.
-        while active_workers > 0 or net_conns:
-            heartbeat()
-            feedback, source, who = feedback_queue.get()
-            if isinstance(feedback, Finished):
-                process_finish(feedback, source)
-            elif isinstance(feedback, Message):
-                context.printer.print(feedback.text, None, who, keep_progress=True)
-            elif isinstance(feedback, WorkDone):
-                if not (options.stop_on_zero and found_zero):
+            # Create queues.
+            worker_task_queue: "Queue[Task]" = Queue()
+            feedback_queue: "Queue[Feedback]" = Queue()
+
+            # Connect to network and create client threads and queues.
+            net_conns: "List[Tuple[threading.Thread, Queue[Task]]]" = []
+            if options.use_network:
+                # Importing the networking modules here so dependencies don't need to be loaded when not using the network mode
+                from .net.client import start_client
+                from .net.core import ServerError, connect, enable_debug_mode
+
+                print("Connecting to permuter@home...")
+                if options.network_debug:
+                    enable_debug_mode()
+                first_stats: Optional[Tuple[int, int, float]] = None
+                for perm_index in range(len(context.permuters)):
+                    try:
+                        port = connect()
+                    except (EOFError, ServerError) as e:
+                        print("Error:", e)
+                        sys.exit(1)
+                    thread, queue, stats = start_client(
+                        port,
+                        context.permuters[perm_index],
+                        perm_index,
+                        feedback_queue,
+                        options.network_priority,
+                    )
+                    net_conns.append((thread, queue))
+                    if first_stats is None:
+                        first_stats = stats
+                assert first_stats is not None, "has at least one permuter"
+                clients_str = plural(first_stats[0], "other client")
+                servers_str = plural(first_stats[1], "server")
+                cores_str = plural(int(first_stats[2]), "core")
+                print(f"Connected! {servers_str} online ({cores_str}, {clients_str})")
+
+            # Start local worker threads
+            processes: List[multiprocessing.Process] = []
+            for _i in range(options.threads):
+                p = multiprocessing.Process(
+                    target=multiprocess_worker,
+                    args=(context.permuters, worker_task_queue, feedback_queue),
+                )
+                p.start()
+                processes.append(p)
+
+            active_workers = len(processes)
+
+            if not active_workers and not net_conns:
+                print("No workers available! Exiting.")
+                sys.exit(1)
+
+            def process_finish(finish: Finished, source: int) -> None:
+                nonlocal active_workers
+
+                if finish.reason:
+                    permuter: Optional[Permuter] = None
+                    if source != -1 and len(context.permuters) > 1:
+                        permuter = context.permuters[source]
+                    context.printer.print(
+                        finish.reason, permuter, None, keep_progress=True
+                    )
+
+                if source == -1:
+                    active_workers -= 1
+
+            def process_result(work: WorkDone, who: Optional[str]) -> bool:
+                permuter = context.permuters[work.perm_index]
+                return post_score(context, permuter, work.result, who)
+
+            def get_task(perm_index: int) -> Optional[Tuple[int, int]]:
+                nonlocal next_iterator_index, seed_iterators_remaining
+                if perm_index == -1:
+                    while seed_iterators_remaining > 0:
+                        task = get_task(next_iterator_index)
+                        next_iterator_index += 1
+                        next_iterator_index %= len(seed_iterators)
+                        if task is not None:
+                            return task
+                else:
+                    it = seed_iterators[perm_index]
+                    if it is not None:
+                        seed = next(it, None)
+                        if seed is None:
+                            seed_iterators[perm_index] = None
+                            seed_iterators_remaining -= 1
+                        else:
+                            return (perm_index, seed)
+                return None
+
+            # Feed the task queue with work and read from results queue.
+            # We generally match these up one-by-one to avoid overfilling queues,
+            # but workers can ask us to add more tasks into the system if they run
+            # out of work. (This will happen e.g. at the very beginning, when the
+            # queues are empty.)
+            while seed_iterators_remaining > 0:
+                heartbeat()
+                feedback, source, who = feedback_queue.get()
+                if isinstance(feedback, Finished):
+                    process_finish(feedback, source)
+                elif isinstance(feedback, Message):
+                    context.printer.print(feedback.text, None, who, keep_progress=True)
+                elif isinstance(feedback, WorkDone):
                     if process_result(feedback, who):
+                        # Found score 0!
                         found_zero = True
-            elif isinstance(feedback, NeedMoreWork):
-                pass
-            else:
-                static_assert_unreachable(feedback)
+                        if options.stop_on_zero:
+                            break
+                elif isinstance(feedback, NeedMoreWork):
+                    task = get_task(source)
+                    if task is not None:
+                        if source == -1:
+                            worker_task_queue.put(task)
+                        else:
+                            net_conns[source][1].put(task)
+                else:
+                    static_assert_unreachable(feedback)
 
-        # Wait for workers to finish.
-        for p in processes:
-            p.join()
+            # Signal workers to stop.
+            for _i in range(active_workers):
+                worker_task_queue.put(Finished())
 
-        # Wait for network connections to close (currently does not happen).
-        for conn in net_conns:
-            conn[0].join()
+            for conn in net_conns:
+                conn[1].put(Finished())
+
+            # Await final results.
+            while active_workers > 0 or net_conns:
+                heartbeat()
+                feedback, source, who = feedback_queue.get()
+                if isinstance(feedback, Finished):
+                    process_finish(feedback, source)
+                elif isinstance(feedback, Message):
+                    context.printer.print(feedback.text, None, who, keep_progress=True)
+                elif isinstance(feedback, WorkDone):
+                    if not (options.stop_on_zero and found_zero):
+                        if process_result(feedback, who):
+                            found_zero = True
+                elif isinstance(feedback, NeedMoreWork):
+                    pass
+                else:
+                    static_assert_unreachable(feedback)
+
+            # Wait for workers to finish.
+            for p in processes:
+                p.join()
+
+            # Wait for network connections to close (currently does not happen).
+            for conn in net_conns:
+                conn[0].join()
+    finally:
+        if options.print_tui and context.tui is not None:
+            context.tui.stop()
 
     if found_zero:
         print("\nFound zero score! Exiting.")
@@ -660,6 +794,24 @@ def main() -> None:
         dest="print_diffs",
         action="store_true",
         help="Instead of compiling generated sources, display diffs against a base version.",
+    )
+    parser.add_argument(
+        "--print-source",
+        dest="print_source",
+        action="store_true",
+        help="Print full generated C sources when a candidate is output.",
+    )
+    parser.add_argument(
+        "--print-all",
+        dest="print_all",
+        action="store_true",
+        help="Print generated C sources for every candidate.",
+    )
+    parser.add_argument(
+        "--tui",
+        dest="print_tui",
+        action="store_true",
+        help="Show a live terminal view with the best and current candidates.",
     )
     parser.add_argument(
         "--abort-exceptions",
@@ -793,6 +945,9 @@ def main() -> None:
         show_errors=args.show_errors,
         show_timings=args.show_timings,
         print_diffs=args.print_diffs,
+        print_source=args.print_source,
+        print_all=args.print_all,
+        print_tui=args.print_tui,
         abort_exceptions=args.abort_exceptions,
         score_threshold=args.score_threshold,
         better_only=args.better_only,
